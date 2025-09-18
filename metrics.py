@@ -87,42 +87,50 @@ def readImages(renders_dir, gt_dir):
 
 
 def evaluate(model_paths):
-    full_dict = {}
-
-    # Create unified metrics file
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    metrics_file = "metric.json"
-
-    # Load existing metrics if file exists
-    if os.path.exists(metrics_file):
-        with open(metrics_file, 'r') as fp:
-            existing_metrics = json.load(fp)
-    else:
-        existing_metrics = {"timestamp": timestamp, "scenes": {}}
-
-    # Update timestamp
-    existing_metrics["timestamp"] = timestamp
-
-    print("")
-
     for scene_dir in model_paths:
         try:
-            print("Scene:", scene_dir)
-            full_dict[scene_dir] = {}
+            # Create unified metrics file
+            timestamp = datetime.now().strftime("%H%M%S%Y%m%d")
+            path = os.path.basename(scene_dir)
+            metrics_file = os.path.join('output/results', path)
+            os.makedirs(metrics_file, exist_ok=True)
+            metrics_file = os.path.join(metrics_file, "metrics.json")
+            
 
-            # Initialize scene in existing metrics if not exists
-            if scene_dir not in existing_metrics["scenes"]:
-                existing_metrics["scenes"][scene_dir] = {}
+            # Load existing metrics if file exists
+            if os.path.exists(metrics_file):
+                try:
+                    with open(metrics_file, 'r') as fp:
+                        existing_data = json.load(fp)
+                        # If it's a list, use it; if it's a single object, convert to list
+                        if isinstance(existing_data, list):
+                            existing_metrics_list = existing_data
+                        else:
+                            existing_metrics_list = [existing_data]
+                except json.JSONDecodeError:
+                    existing_metrics_list = []
+            else:
+                existing_metrics_list = []
+
+            # Create new metrics entry
+            new_metrics = {"timestamp": timestamp, "scenes": {}}
+            
+            print("Scene:", scene_dir)
+            # full_dict[scene_dir] = {}
+
+            # Initialize scene in new metrics if not exists
+            if scene_dir not in new_metrics["scenes"]:
+                new_metrics["scenes"][scene_dir] = {}
 
             test_dir = Path(scene_dir) / "test"
 
             for method in os.listdir(test_dir):
                 print("Method:", method)
 
-                full_dict[scene_dir][method] = {}
+                # full_dict[scene_dir][method] = {}
 
-                # Initialize method in existing metrics
-                existing_metrics["scenes"][scene_dir][method] = {}
+                # Initialize method in new metrics
+                new_metrics["scenes"][scene_dir][method] = {}
 
                 method_dir = test_dir / method
                 gt_dir = method_dir / "gt"
@@ -138,9 +146,9 @@ def evaluate(model_paths):
                     psnrs.append(psnr(renders[idx], gts[idx]))
                     lpipss.append(lpips(renders[idx], gts[idx], net_type='vgg'))
 
-                print("  SSIM : {:>12.7f}".format(torch.tensor(ssims).mean(), ".5"))
-                print("  PSNR : {:>12.7f}".format(torch.tensor(psnrs).mean(), ".5"))
-                print("  LPIPS: {:>12.7f}".format(torch.tensor(lpipss).mean(), ".5"))
+                print("  SSIM : {:>12.7f}".format(torch.tensor(ssims).mean()))
+                print("  PSNR : {:>12.7f}".format(torch.tensor(psnrs).mean()))
+                print("  LPIPS: {:>12.7f}".format(torch.tensor(lpipss).mean()))
 
                 # Get Gaussian point count and model size
                 iteration = int(method.split('_')[-1])
@@ -156,44 +164,28 @@ def evaluate(model_paths):
                 image_metrics = calculate_image_metrics(renders)
                 print(f"  Resolution: {image_metrics['resolution']}")
                 print("")
-
-                # Update full_dict with all metrics
-                full_dict[scene_dir][method].update({
-                    "SSIM": torch.tensor(ssims).mean().item(),
-                    "PSNR": torch.tensor(psnrs).mean().item(),
-                    "LPIPS": torch.tensor(lpipss).mean().item(),
+                # Update new metrics with new data
+                new_metrics["scenes"][scene_dir][method].update({
+                    "SSIM": "{:.4f}".format(torch.tensor(ssims).mean().item()),
+                    "PSNR": "{:.4f}".format(torch.tensor(psnrs).mean().item()),
+                    "LPIPS": "{:.4f}".format(torch.tensor(lpipss).mean().item()),
                     "num_gaussians": num_points,
-                    "model_size_MB": model_size / 1024 / 1024,
+                    "model_size_MB": "{:.4f}".format(model_size / 1024 / 1024),
                     "resolution": image_metrics['resolution'],
                     "image_count": image_metrics['image_count'],
                     "total_pixels": image_metrics['total_pixels']
                 })
-
-                # Update existing metrics with new data
-                existing_metrics["scenes"][scene_dir][method].update({
-                    "SSIM": torch.tensor(ssims).mean().item(),
-                    "PSNR": torch.tensor(psnrs).mean().item(),
-                    "LPIPS": torch.tensor(lpipss).mean().item(),
-                    "num_gaussians": num_points,
-                    "model_size_MB": model_size / 1024 / 1024,
-                    "resolution": image_metrics['resolution'],
-                    "image_count": image_metrics['image_count'],
-                    "total_pixels": image_metrics['total_pixels']
-                })
-
-            # Save original format file
-            with open(scene_dir + "/results.json", 'w') as fp:
-                json.dump(full_dict[scene_dir], fp, indent=True)
+                    # Save all metrics to unified file - append as array
+                existing_metrics_list.append(new_metrics)
+                with open(metrics_file, 'w') as fp:
+                    json.dump(existing_metrics_list, fp, indent=2)
+                return metrics_file
+            
         except Exception as e:
             print("Unable to compute metrics for model", scene_dir)
             print("Error:", e)
 
-    # Save all metrics to unified file
-    with open(metrics_file, 'w') as fp:
-        json.dump(existing_metrics, fp, indent=True)
-    # print(f"All metrics saved to: {metrics_file}")
 
-    return metrics_file
 
 
 if __name__ == "__main__":

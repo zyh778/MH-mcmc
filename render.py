@@ -88,8 +88,11 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
 
 def save_render_metrics(model_path, iteration, render_metrics, gaussians):
     """Save render metrics to unified render.json file"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    render_file = "render.json"
+    timestamp = datetime.now().strftime("%H%M%S%Y%m%d")
+    path = os.path.basename(model_path)
+    render_file = os.path.join('output/results', path)
+    os.makedirs(render_file, exist_ok=True)
+    render_file = os.path.join(render_file, "render.json")
 
     # Get model info
     num_gaussians = len(gaussians._xyz) if hasattr(gaussians, '_xyz') else 0
@@ -101,41 +104,50 @@ def save_render_metrics(model_path, iteration, render_metrics, gaussians):
             width, height = map(int, metrics['resolution'].split('x'))
             total_pixels += width * height * metrics['image_count']
 
-    # Load existing render data if file exists and is not empty
-    existing_data = {"timestamp": timestamp, "scenes": {}}
+    # Load existing render data if file exists
     if os.path.exists(render_file):
         try:
             with open(render_file, 'r') as fp:
-                file_content = fp.read().strip()
-                if file_content:
-                    existing_data = json.load(fp)
+                existing_data = json.load(fp)
+                # If it's a list, use it; if it's a single object, convert to list
+                if isinstance(existing_data, list):
+                    existing_data_list = existing_data
+                else:
+                    existing_data_list = [existing_data]
         except (json.JSONDecodeError, IOError) as e:
             print(f"Warning: Could not load existing render.json file: {e}")
-            existing_data = {"timestamp": timestamp, "scenes": {}}
+            existing_data_list = []
+    else:
+        existing_data_list = []
 
-    # Update timestamp
-    existing_data["timestamp"] = timestamp
+    # Create new render metrics entry
+    new_entry = {
+        "timestamp": timestamp,
+        "scenes": {}
+    }
 
-    # Initialize scene path if not exists
-    scene_key = f"{model_path}/ours_{iteration}"
-    if scene_key not in existing_data["scenes"]:
-        existing_data["scenes"][scene_key] = {}
+    # Initialize scene path
+    scene_key = f"{model_path}"
+    new_entry["scenes"][scene_key] = {}
 
     # Update with render metrics
     for set_name, metrics in render_metrics.items():
-        existing_data["scenes"][scene_key][set_name] = {
-            "total_render_time": metrics["total_render_time"],
-            "avg_frame_time": metrics["avg_frame_time"],
-            "fps": metrics["fps"],
+        new_entry["scenes"][scene_key][set_name] = {
+            "total_render_time": "{:.4f}s".format(metrics["total_render_time"]),
+            "avg_frame_time": "{:.4f}ms".format(metrics["avg_frame_time"]*1000),
+            "FPS": "{:.4f}fps".format(metrics["fps"]),
             "resolution": metrics["resolution"],
             "image_count": metrics["image_count"],
             "num_gaussians": num_gaussians,
             "total_pixels": total_pixels
         }
 
-    # Save to file
+    # Append new entry to list
+    existing_data_list.append(new_entry)
+
+    # Save to file as array
     with open(render_file, 'w') as fp:
-        json.dump(existing_data, fp, indent=True)
+        json.dump(existing_data_list, fp, indent=2)
 
     print(f"Render metrics saved to: {render_file}")
 

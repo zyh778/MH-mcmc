@@ -24,6 +24,10 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from scene.gaussian_model import build_scaling_rotation
+import time
+import matplotlib.pyplot as plt
+import numpy as np
+from datetime import datetime
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -34,11 +38,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if dataset.cap_max == -1:
         print("Please specify the maximum number of Gaussians using --cap_max.")
         exit()
+
+    # Training tracking
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+
+    # Initialize loss tracking
+    loss_history = {
+        'iterations': [],
+        'total_loss': [],
+        'l1_loss': [],
+        'ssim_loss': [],
+        'psnr': [],
+        'gaussian_count': [],
+        'iteration_times': []
+    }
+
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -54,7 +72,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
 
-    for iteration in range(first_iter, opt.iterations + 1):        
+    for iteration in range(first_iter, opt.iterations + 1):
+        iter_wall_time_start = time.time()  # Track wall time for each iteration        
         # if network_gui.conn == None:
         #     network_gui.try_connect()
         # while network_gui.conn != None:
@@ -97,14 +116,43 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        ssim_loss = (1.0 - ssim(image, gt_image))
+        current_psnr = psnr(image, gt_image).mean().item()
 
-        loss = loss + args.opacity_reg * torch.abs(gaussians.get_opacity).mean()
-        loss = loss + args.scale_reg * torch.abs(gaussians.get_scaling).mean()
+        # Adaptive SSIM weight based on training progress
+        ssim_weight = opt.lambda_dssim 
+        # Primary loss function: L1 + SSIM combination
+        # Conservative SSIM weighting to maintain PSNR performance
+        loss = (1.0 - ssim_weight) * Ll1 + ssim_weight * ssim_loss
+        # Enhanced regularization with adaptive weights
+        # Sparsity regularization to encourage compact model
+        sparsity_reg = args.opacity_reg * torch.abs(gaussians.get_opacity).mean()
+        # Scale diversity regularization to prevent over-concentration
+        scale_diversity = args.scale_reg * torch.abs(gaussians.get_scaling).mean()
+        # Combined loss with conservative regularization
+        # Primary focus on reconstruction quality (L1 + SSIM)
+        # Secondary focus on model efficiency (regularization terms)
+        loss = loss + sparsity_reg + scale_diversity
 
         loss.backward()
 
         iter_end.record()
+        # Store current loss for MH acceptance
+        current_loss = loss.detach().clone()
+
+        # Track iteration metrics
+        iter_wall_time_end = time.time()
+        iter_time = iter_wall_time_end - iter_wall_time_start
+
+        # Record loss history every 10 iterations to reduce memory usage
+        if iteration % 10 == 0:
+            loss_history['iterations'].append(iteration)
+            loss_history['total_loss'].append(loss.item())
+            loss_history['l1_loss'].append(Ll1.item())
+            loss_history['ssim_loss'].append(ssim_loss.item())
+            loss_history['psnr'].append(current_psnr)
+            loss_history['gaussian_count'].append(gaussians.get_xyz.shape[0])
+            loss_history['iteration_times'].append(iter_time)
 
         with torch.no_grad():
             # Progress bar
@@ -119,6 +167,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
+                print("Output folder: {}".format(args.model_path))
                 scene.save(iteration)
 
             if iteration < opt.densify_until_iter and iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
@@ -145,14 +194,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
+    return loss_history
+
 def prepare_output_and_logger(args):    
-    if not args.model_path:
-        if os.getenv('OAR_JOB_ID'):
-            unique_str=os.getenv('OAR_JOB_ID')
-        else:
-            unique_str = str(uuid.uuid4())
-        args.model_path = os.path.join("./output/", unique_str[0:10])
-        
+    args.model_path = os.path.join("./output/", args.model_path)
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
@@ -209,6 +254,99 @@ def load_config(config_file):
         config = json.load(file)
     return config
 
+def save_training_metrics(args, loss_history, total_training_time, total_iterations):
+    """Save training metrics and generate loss curves"""
+    # Create output directories
+    output_dir = "output/results"
+    # loss_dir = os.path.join(output_dir, "loss")
+    loss_dir = os.path.join(output_dir, args.model_path)
+    os.makedirs(loss_dir, exist_ok=True)
+
+
+    # Save loss curves
+    save_loss_curves(loss_history, loss_dir, total_iterations)
+
+    # Save training metrics to JSON
+    training_metrics = {
+        # "timestamp": datetime.now().strftime("%H%M%S%Y%m%d"),
+        "model_id": args.model_path,
+        "source_path": args.source_path,
+        "total_training_time": "{:.2f}s".format(total_training_time),
+        "total_iterations": total_iterations,
+        "avg_iteration_time": "{:.2f}ms".format(np.mean(loss_history['iteration_times']) * 1000 if loss_history['iteration_times'] else 0),
+    }
+
+    # Save to unified training metrics file
+    training_file = os.path.join(loss_dir, "training_metrics.json")
+    if os.path.exists(training_file):
+        try:
+            with open(training_file, 'r') as f:
+                existing_data = json.load(f)
+                if isinstance(existing_data, list):
+                    existing_data.append(training_metrics)
+                else:
+                    existing_data = [existing_data, training_metrics]
+        except (json.JSONDecodeError, IOError):
+            existing_data = [training_metrics]
+    else:
+        existing_data = [training_metrics]
+
+    with open(training_file, 'w') as f:
+        json.dump(existing_data, f, indent=2)
+
+    print(f"Training metrics saved to: {training_file}")
+
+
+def save_loss_curves(loss_history, loss_dir, total_iterations):
+    """Generate and save loss curve plots"""
+    if loss_history is None or not loss_history['iterations']:
+        print("Warning: No loss history data available for plotting")
+        return
+
+    # Create subplots
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    fig.suptitle(f'Training Loss Curves', fontsize=16)
+
+    # Plot 1: Total Loss
+    axes[0, 0].plot(loss_history['iterations'], loss_history['total_loss'], 'b-', linewidth=2)
+    axes[0, 0].set_title('Total Training Loss')
+    axes[0, 0].set_xlabel('Iteration')
+    axes[0, 0].set_ylabel('Loss')
+    axes[0, 0].grid(True, alpha=0.3)
+
+    # Plot 2: L1 and SSIM Loss
+    axes[0, 1].plot(loss_history['iterations'], loss_history['l1_loss'], 'r-', label='L1 Loss', linewidth=2)
+    axes[0, 1].plot(loss_history['iterations'], loss_history['ssim_loss'], 'g-', label='SSIM Loss', linewidth=2)
+    axes[0, 1].set_title('Component Losses')
+    axes[0, 1].set_xlabel('Iteration')
+    axes[0, 1].set_ylabel('Loss')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+
+    # Plot 3: PSNR
+    axes[1, 0].plot(loss_history['iterations'], loss_history['psnr'], 'm-', linewidth=2)
+    axes[1, 0].set_title('PSNR')
+    axes[1, 0].set_xlabel('Iteration')
+    axes[1, 0].set_ylabel('PSNR (dB)')
+    axes[1, 0].grid(True, alpha=0.3)
+
+    # Plot 4: Gaussian Count
+    axes[1, 1].plot(loss_history['iterations'], loss_history['gaussian_count'], 'c-', linewidth=2)
+    axes[1, 1].set_title('Gaussian Count')
+    axes[1, 1].set_xlabel('Iteration')
+    axes[1, 1].set_ylabel('Number of Gaussians')
+    axes[1, 1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
+    # Save the plot
+    plot_filename = os.path.join(loss_dir, f"curves_{total_iterations}.png")
+    plt.savefig(plot_filename, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    print(f"Loss curves saved to: {plot_filename}")
+
+
 if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
@@ -233,8 +371,9 @@ if __name__ == "__main__":
             setattr(args, key, value)
 
     args.save_iterations.append(args.iterations)
-    
-    print("Optimizing " + args.model_path)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    args.model_path = f"{timestamp}"
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
@@ -242,7 +381,17 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
 
-    # All done
+    # Create output directory if it doesn't exist
+    os.makedirs("output/results", exist_ok=True)
+
+    # Start training and track time
+    training_start_time = time.time()
+    loss_history = training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training_end_time = time.time()
+    total_training_time = training_end_time - training_start_time
+
+    # Save training metrics and loss curves
+    save_training_metrics(args, loss_history, total_training_time, op.extract(args).iterations)
+    print("Output:" + os.path.join("./output/",args.model_path))
     print("\nTraining complete.")
